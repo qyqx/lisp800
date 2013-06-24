@@ -1,3 +1,10 @@
+/**
+ * LISP 800 is a tiny lisp interpreter originally written by Teemu Kalvas
+ * for the obfuscated C code contest.
+ * This is an attempt to rewrite it in the understandable manner.
+ */
+
+#include <assert.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -12,14 +19,12 @@
 #define setjmp(e) sigsetjmp(e, 0)
 #define longjmp siglongjmp
 #endif
+
 #ifdef _WIN32
 #include <windows.h>
 #define X __declspec(dllexport)
 #else
 #define X
-#endif
-
-#ifndef _WIN32
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -31,12 +36,136 @@
 #define countof(x) (sizeof(x)/sizeof((x)[0]))
 #endif
 
-typedef int lval;
+/* TODO: forget about windows and use stdbool? */
+typedef int lbool;
+#define L_FALSE (0)
+#define L_TRUE (1)
 
-lval *o2c(lval o) {
+/**
+ * Integer type, compatible with lval type. All the resultant integers
+ * should be placed into this type to avoid overflow error.
+ */
+typedef intptr_t lint;
+
+/**
+ * Main lvalue representation.
+ * </p>
+ * First two bits represents a value type.
+ * </p>
+ * Note, that pointer types (e.g. cons cells) - are expected to be *ALWAYS*
+ * aligned at least by 4, since the trailing bits are used to represent type
+ * information and considered to always be zero.
+ * This seems to not be a problem for all the modern unix.
+ * </p>
+ * Zero value is reinterpreted as nil.
+ *
+ * @see #LVAL_TYPE_MASK
+ * @see #LVAL_ANUM_TYPE
+ * @see #LVAL_CONS_TYPE
+ * @see #LVAL_IREF_TYPE
+ * @see #LVAL_JREF_TYPE
+ */
+typedef lint lval;
+
+
+/**
+ * Value that represents lval's nil
+ */
+#define LVAL_NIL            ((lval) 0)
+
+/**
+ * Represents bit mask that should be applied to lval to extract type info.
+ * Changing this to the different value will have immediate impact on all the
+ * bitwise type operations.
+ */
+#define LVAL_TYPE_MASK      (3)
+
+
+/**
+ * Extracts lval type (first two bits)
+ */
+#define LVAL_GET_TYPE(l) ((l) & LVAL_TYPE_MASK)
+
+/**
+ * Simple objects written as is into the lval.
+ */
+#define LVAL_INLINE_TYPE    (0)
+
+
+/**
+ * Cons cell
+ */
+#define LVAL_CONS_TYPE      (1)
+
+/**
+ * IREF objects.
+ * Sub types: symbol, simple-vector, array, package, function
+ */
+#define LVAL_IREF_TYPE      (2)
+
+/**
+ * JREF objects.
+ * Sub types: simple-string, double, simple-bit-vector, file-stream
+ */
+#define LVAL_JREF_TYPE      (3)
+
+
+
+/**
+ * JREF objects.
+ * Sub types: simple-string, double, simple-bit-vector, file-stream
+ */
+#define LVAL_JREF_TYPE      (3)
+
+/**
+ * Char code bit - applicable for ANUM type
+ */
+#define LVAL_CHAR_BIT       (8)
+
+/* Int conversion to/from lval */
+#define LVAL_AS_INT(l)      ((l) >> 5)
+#define INT_AS_LVAL(l)      ((l) << 5)
+
+
+
+/**
+ * GC marker bit
+ *
+ * @see #gcm
+ * @see #gc
+ */
+#define LVAL_GCM_BIT        (4)
+
+
+/* Subtype codes */
+
+#define LVAL_IREF_FUNCTION_SUBTYPE              (212)
+#define LVAL_IREF_SYMBOL_SUBTYPE                (20)
+#define LVAL_IREF_SIMPLE_VECTOR_SUBTYPE         (116)
+#define LVAL_IREF_PACKAGE_SUBTYPE               (180)
+
+#define LVAL_JREF_SIMPLE_STRING_SUBTYPE         (20)
+#define LVAL_JREF_DOUBLE_SUBTYPE                (84)
+#define LVAL_JREF_BIT_VECTOR_SUBTYPE            (116)
+
+#define LVAL_JREF_SIZE_BIT_SHIFT                (6)
+
+#define LVAL_IREF_SIZE_BIT_SHIFT                (8)
+
+
+/**
+ * Interprets lval object as cons, this function is for cons'es only
+ * @see #LVAL_CONS_TYPE
+ */
+lval * o2c(lval o) {
+    assert(LVAL_GET_TYPE(o) == LVAL_CONS_TYPE);
     return (lval *) (o - 1);
 }
 
+/**
+ * Interprets cons as object, this function is for cons'es only
+ * @see #LVAL_CONS_TYPE
+ */
 lval c2o(lval * c) {
     return (lval) c + 1;
 }
@@ -46,31 +175,33 @@ int cp(lval o) {
 }
 
 lval *o2a(lval o) {
-    return (lval *) (o - 2);
+    assert(LVAL_GET_TYPE(o) == LVAL_IREF_TYPE);
+    return (lval *) (o - LVAL_IREF_TYPE);
 }
 
 lval a2o(lval * a) {
-    return (lval) a + 2;
+    return (lval) a + LVAL_IREF_TYPE;
 }
 
 int ap(lval o) {
-    return (o & 3) == 2;
+    return (o & LVAL_TYPE_MASK) == LVAL_IREF_TYPE;
 }
 
 lval *o2s(lval o) {
+    assert(LVAL_GET_TYPE(o) == LVAL_JREF_TYPE);
     return (lval *) (o - 3);
 }
 
 char *o2z(lval o) {
-    return (char *) (o - 3 + 2 * sizeof(lval));
+    return (char *) (o - LVAL_JREF_TYPE + 2 * sizeof(lval));
 }
 
 lval s2o(lval * s) {
-    return (lval) s + 3;
+    return (lval) s + LVAL_JREF_TYPE;
 }
 
 int sp(lval o) {
-    return (o & 3) == 3;
+    return (o & LVAL_TYPE_MASK) == LVAL_JREF_TYPE;
 }
 
 struct symbol_init {
@@ -84,6 +215,7 @@ struct symbol_init {
 
 extern struct symbol_init symi[];
 
+/* TODO: use saved value instead */
 #define TRUE symi[1].sym
 #define T g[-2]
 #define U g[-3]
@@ -94,11 +226,11 @@ extern struct symbol_init symi[];
 #define NE *g
 
 lval car(lval c) {
-    return (c & 3) == 1 ? o2c(c)[0] : 0;
+    return (c & 3) == 1 ? o2c(c)[0] : LVAL_NIL;
 }
 
 lval cdr(lval c) {
-    return (c & 3) == 1 ? o2c(c)[1] : 0;
+    return (c & 3) == 1 ? o2c(c)[1] : LVAL_NIL;
 }
 
 lval caar(lval c) {
@@ -111,19 +243,13 @@ lval cdar(lval c) {
     return cdr(car(c));
 }
 
-lval evca(lval *, lval);
-
 lval cadr(lval c) {
     return car(cdr(c));
 }
 
-int dbgr(lval *, int, lval, lval *);
-
 lval cddr(lval c) {
     return cdr(cdr(c));
 }
-
-void print(lval);
 
 lval set_car(lval c, lval val) {
     return o2c(c)[0] = val;
@@ -133,7 +259,13 @@ lval set_cdr(lval c, lval val) {
     return o2c(c)[1] = val;
 }
 
-lval *binding(lval * f, lval sym, int type, int *macro) {
+lval evca(lval *, lval);
+
+int dbgr(lval *, int, lval, lval *);
+
+void print(lval);
+
+lval * binding(lval * f, lval sym, int type, int *macro) {
     lval env;
     st:
     for (env = E; env; env = cdr(env)) {
@@ -152,13 +284,13 @@ lval *binding(lval * f, lval sym, int type, int *macro) {
         dbgr(f, type, sym, &sym);
         goto st;
     }
-    return o2a(sym) + 4 + type;
+    return o2a(sym) + sizeof(lval) + type;
 }
 
-lval *memory;
-lval *memf;
+lval * memory;
+lval * memf;
 int memory_size;
-lval *stack;
+lval * stack;
 lval xvalues = 8;
 lval dyns = 0;
 jmp_buf top_jmp;
@@ -193,21 +325,22 @@ void gcm(lval v) {
 
 lval gc(lval * f) {
     int i;
-    lval *m;
+    lval * m;
     int l;
     int u = 0;
-    int ml;
+    int ml = 0;
     printf(";garbage collecting...\n");
     while (memf) {
         lval *n = (lval *) memf[0];
-        memset(memf, 0, 4 * memf[1]);
+        memset(memf, 0, sizeof(lval) * memf[1]);
         memf = (lval *) n;
     }
     gcm(xvalues);
     gcm(pkgs);
     gcm(dyns);
     for (; f > stack; f--) {
-        if ((*f & 3) && (*f < memory || *f > memory + memory_size / 4)) {
+        if ((*f & 3) && (*f < memory ||
+                         *f > (memory + memory_size / sizeof(lval)))) {
             printf("%x\n", *f);
         }
         gcm(*f);
@@ -215,7 +348,7 @@ lval gc(lval * f) {
     memf = 0;
     m = memory;
     i = 0;
-    while (m < memory + memory_size / 4) {
+    while (m < (memory + memory_size / sizeof(lval))) {
         l = ((m[1] & 4 ? m[0] >> 8 : 0) + 1) & ~1;
         if (m[0] & 4) {
             if (u) {
@@ -245,62 +378,85 @@ lval gc(lval * f) {
     return 0;
 }
 
-lval *m0(lval * g, int n) {
-    lval *m = memf;
-    lval *p = 0;
-    n = (n + 1) & ~1;
+/**
+ * Allocates n lval units in the context memory and returns it.
+ * Returns NULL if no free cells available.
+ * The caller party may use n lval blocks if the returned pointer is not null.
+ */
+lval * m0(int n) {
+    lval * m = memf; /* start searching from the first memory sub block */
+    lval * p = 0; /* previous memory sub block */
+
+    n = (n + 1) & ~1; /* round odd size to the greater even */
+
+    /* iterate over the available sub blocks */
     for (; m; m = (lval *) m[0]) {
         if (n <= m[1]) {
+            /* size requested fits into the current sub block */
             if (m[1] == n) {
                 if (p) {
                     p[0] = m[0];
                 } else {
+                    /* allocate the entire sub block, but update memf pointer */
                     memf = (lval *) m[0];
                 }
-            }
-            else {
+            } else {
                 m[1] -= n;
                 m += m[1];
             }
             return m;
         }
+
         p = m;
     }
-    return 0;
+
+    return NULL;
 }
 
-lval *ma0(lval * g, int n) {
-    lval *m;
-    st:
-    m = m0(g, n + 2);
-    if (!m) {
+#define GC_MAX_RETRY    (3)
+
+/**
+ * Allocates n lval units, applies gcm to the mgc lvals in variadic params.
+ * Never returns NULL.
+ */
+lval * cm0(lval * g, int n) {
+    lval * m;
+    int i;
+    for (i = 0; i < GC_MAX_RETRY; ++i) {
+        m = m0(n);
+        if (m) {
+            break;
+        }
         gc(g);
-        goto st; /* TODO: loop? */
     }
-    *m = n << 8;
+    /* Recheck pointer after gc */
+    if (!m) {
+        fprintf(stderr, "Out of memory");
+        exit(-1);
+    }
     return m;
 }
 
-lval *ms0(lval * g, int n) {
-    lval *m;
-    st:
-    m = m0(g, (n + 12) / 4);
-    if (!m) {
-        gc(g);
-        goto st;
-    }
-    *m = (n + 4) << 6;
+/**
+ * Allocates iref
+ */
+lval * ma0(lval * g, int n) {
+    lval * m = cm0(g, n + 2);
+    *m = n << LVAL_IREF_SIZE_BIT_SHIFT;
+    return m;
+}
+
+/**
+ * Allocates jref
+ */
+lval * ms0(lval * g, int n) {
+    lval * m = cm0(g, n / sizeof(lval) + 3);
+    *m = (n + sizeof(lval)) << LVAL_JREF_SIZE_BIT_SHIFT;
     return m;
 }
 
 lval *mb0(lval * g, int n) {
-    lval *m;
-    st:
-    m = m0(g, (n + 95) / 32);
-    if (!m) {
-        gc(g);
-        goto st;
-    }
+    lval *m = cm0(g, (n + 95) / 32);
     *m = (n + 31) << 3;
     return m;
 }
@@ -308,39 +464,26 @@ lval *mb0(lval * g, int n) {
 X lval ma(lval * g, int n, ...) {
     va_list v;
     int i;
-    lval *m;
-    st:
-    va_start(v, n);
-    m = m0(g, n + 2);
-    if (!m) {
-        for (i = -1; i < n; i++) {
-            gcm(va_arg(v, lval));
-        }
-        gc(g);
-        goto st;
-    }
+    lval *m = cm0(g, n + 2);
     *m = n << 8;
+    va_start(v, n);
     for (i = -1; i < n; i++) {
         m[2 + i] = va_arg(v, lval);
     }
+    va_end(v);
     return a2o(m);
 }
 
 X lval ms(lval * g, int n,...) {
     va_list v;
     int i;
-    lval *m;
-    st:
-    va_start(v, n);
-    m = m0(g, n + 2);
-    if (!m) {
-        gc(g);
-        goto st;
-    }
+    lval *m  = cm0(g, n + 2);
     *m = n << 8;
+    va_start(v, n);
     for (i = -1; i < n; i++) {
         m[2 + i] = va_arg(v, lval);
     }
+    va_end(v);
     return s2o(m);
 }
 
@@ -369,13 +512,21 @@ unsigned o2u(lval o) {
     return (unsigned) o2d(o);
 }
 
+/**
+ * Creates cons cell of a and b.
+ * Stack pointer f is used for garbage collecting.
+ */
 lval cons(lval * g, lval a, lval d) {
-    lval *c = m0(g, 2);
+    lval *c = m0(2);
     if (!c) {
         gcm(a);
         gcm(d);
         gc(g);
-        c = m0(g, 2);
+        c = m0(2);
+        if (!c) {
+            fprintf(stderr, "Out of memory");
+            exit(-1);
+        }
     }
     c[0] = a;
     c[1] = d;
@@ -477,11 +628,13 @@ lval args(lval * f, lval m, int c) {
                 break;
             case -2:
                 n = argi(n, &k);
-                for (l = g; l < h - 1; l += 2)
+                for (l = g; l < h - 1; l += 2) {
                     if (string_equal(o2a(n)[2], o2a(*l)[2]) && o2a(*l)[9] == kwp) {
                         k = l[1];
                         break;
-                    } *h = argd(h, n, l < h - 1 ? k : evca(h, k));
+                    }
+		}
+		*h = argd(h, n, l < h - 1 ? k : evca(h, k));
                 continue;
             case 4:
                 *h = cons(h, cons(h, n, rest(h - 1, f + 1)), *h);
@@ -492,7 +645,8 @@ lval args(lval * f, lval m, int c) {
                 t = 0;
                 continue;
             }
-        } g++;
+        }
+	g++;
     }
     if (m) {
         return cons(h, cons(h, m, rest(h - 1, g)), *h);
@@ -750,6 +904,7 @@ lval eval_function(lval * f, lval ex) {
     ex = car(ex);
     if (cp(ex)) {
         if (car(ex) == symi[75].sym) {
+            /* 75 - lambda */
             lval n = 0;
             x = cddr(ex);
             if (!cdr(x) && caar(x) == symi[23].sym) {
@@ -813,7 +968,8 @@ lval eval_go(lval * f, lval ex) {
     if (o2s(cdr(b))[2]) {
         unwind(f, car(b));
         longjmp(*(jmp_buf *) (o2s(cdr(b))[2]), car(ex));
-    } dbgr(f, 9, car(ex), &ex);
+    }
+    dbgr(f, 9, car(ex), &ex);
     longjmp(top_jmp, 1);
 }
 
@@ -923,17 +1079,17 @@ lval eval_multiple_value_prog1(lval * f, lval ex) {
 }
 
 lval eval_declare(lval * f, lval ex) {
-    return 0;
+    return LVAL_NIL;
 }
 
 lval l2(lval * f, lval a, lval b) {
-    return cons(f, a, cons(f, b, 0));
+    return cons(f, a, cons(f, b, LVAL_NIL));
 }
 
 lval eval_setf(lval * f, lval ex) {
     lval r;
     int m;
-    NF(1) T = 0;
+    NF(1) T = LVAL_NIL;
 
     ag:
     if (!cp(car(ex))) {
@@ -971,7 +1127,8 @@ lval lapply(lval * f, lval * h) {
         h[0] = cdr(h[-1]);
         h[-1] = car(h[-1]);
         h++;
-    } return call(f, f[1], h - f - 3);
+    }
+    return call(f, f[1], h - f - 3);
 }
 
 lval leq(lval * f) {
@@ -1144,15 +1301,21 @@ lval limakunbound(lval * f) {
 }
 
 lval liref(lval * f) {
-    if (o2u(f[2]) >= o2a(f[1])[0] / 256 + 2)
-        write(1, "out of bounds in iref\n", 22);
+    if (!(f[1] & 2)) {
+        printf("non-iref object\n"); /* Preventing SEGFAULT */
+        return 0;
+    }
+    if (o2u(f[2]) >= o2a(f[1])[0] / 256 + 2) {
+        printf("out of bounds in iref\n");
+    }
     return ((lval *) (f[1] & ~3))[o2u(f[2])] & ~4;
 }
 
 lval setfiref(lval * f) {
     int i = o2i(f[3]);
-    if (i >= o2a(f[2])[0] / 256 + 2)
+    if (i >= o2a(f[2])[0] / 256 + 2) {
         printf("out of bounds in setf iref\n");
+    }
     return ((lval *) (f[2] & ~3))[i] = i == 1 ? f[1] | 4 : f[1];
 }
 
@@ -1319,31 +1482,38 @@ lval leval(lval * f, lval * h) {
 
 void psym(lval p, lval n) {
     int i;
-    if (!p)
+    if (!p) {
         printf("#:");
-    else if (p != pkg) {
+    } else if (p != pkg) {
         lval m = car(o2a(p)[2]);
-        for (i = 0; i < o2s(m)[0] / 64 - 4; i++)
+        for (i = 0; i < o2s(m)[0] / 64 - 4; i++) {
             putchar(o2z(m)[i]);
+        }
         putchar(':');
-    } for (i = 0; i < o2s(n)[0] / 64 - 4; i++)
+    }
+
+    for (i = 0; i < o2s(n)[0] / 64 - 4; i++) {
         putchar(o2z(n)[i]);
+    }
 }
 
 void print(lval x) {
     int i;
     switch (x & 3) {
     case 0:
-        if (x)
-            if (x & 8)
-                if (x >> 5 < 256 && isgraph(x >> 5))
+        if (x) {
+            if (x & 8) {
+                if (x >> 5 < 256 && isgraph(x >> 5)) {
                     printf("#\\%c", x >> 5);
-                else
+                } else {
                     printf("#\\U+%d", x >> 5);
-            else
+                }
+            } else {
                 printf("%d", x >> 5);
-        else
+            }
+        } else {
             printf("nil");
+        }
         break;
     case 1:
         printf("(");
@@ -1355,7 +1525,8 @@ void print(lval x) {
         if (x) {
             printf(" . ");
             print(x);
-        } printf(")");
+        }
+        printf(")");
         break;
     case 2:
         switch (o2a(x)[1]) {
@@ -1373,7 +1544,8 @@ void print(lval x) {
                 if (i)
                     printf(" ");
                 print(o2a(x)[i + 2]);
-            } printf(")");
+            } 
+            printf(")");
             break;
         case 180:
             printf("#<package ");
@@ -1419,19 +1591,87 @@ lval lexit(lval * f) {
     return 0;
 }
 
+static void print_with_desc(const char * what, lval v) {
+    printf("; %s ", what);
+    if (v != 8) {
+	print(v);
+    } else {
+	printf("<UNBOUND>");
+    }
+    printf("\n");
+}
+
+lval linspect(lval * f) {
+    lval x = f[1];
+    printf(";; The object is a ");
+    switch (x & 3) {
+    case 0:
+	if (x == 0) {
+	    printf("NIL");
+	} else if (x & 8) {
+	    printf("CHAR");
+	} else {
+	    printf("FIXNUM");
+	}
+	break;
+    case 1:
+	printf("CONS");
+	break;
+    case 2:
+	switch (o2a(x)[1]) {
+	case 212:
+	    printf("FUNCTION");
+	    break;
+	case 20:
+	    printf("SYMBOL");
+	    break;
+	case 116:
+	    printf("ARRAY");
+	    break;
+	case 180:
+	    printf("PACKAGE");
+	    break;
+	default:
+	    printf("UNKNOWN-IREF(%d)", o2a(x)[1]);
+	}
+	break;
+    case 3:
+	switch (o2s(x)[1]) {
+	case 20:
+	    printf("SIMPLE-STRING");
+	    break;
+	case 84:
+	    printf("DOUBLE");
+	    break;
+	}
+    }
+    printf(".\n");
+    if ((x & 3) == 2 && o2a(x)[1] == 20) {
+	/* symbol extra info */
+	print_with_desc("Name is", o2a(x)[2]);
+	print_with_desc("Package is", o2a(x)[9]);
+	print_with_desc("Value is", o2a(x)[4]);
+	print_with_desc("Function is", o2a(x)[5]);
+	print_with_desc("Macro is ", o2a(x)[6]);
+    }
+    return 0;
+}
+
 int ep(lval * g, lval expr) {
     int i;
     lval v = rvalues(g, eval(g, expr));
-    if (car(v) == 8)
+    if (car(v) == 8) {
         return 0;
-    if (v)
+    }
+    if (v) {
         for (i = 0; v; v = cdr(v)) {
             printf(";%d: ", i++);
             print(car(v));
             printf("\n");
         }
-    else
+    } else {
         printf(";no values\n");
+    }
     return 1;
 }
 
@@ -1558,6 +1798,18 @@ int getnws() {
     int c;
     do {
         c = getc(ins);
+	if (c == ';') {
+	    c = getc(ins);
+	    if (c == ';') {
+		/* skip to the newline or EOF */
+		do {
+		    c = getc(ins);
+		} while (c != '\n' && c != '\r' && c != EOF);
+		continue;
+	    }
+	    ungetc(c, ins);
+	    break;
+	}
     } while (isspace(c));
     return c;
 }
@@ -1588,13 +1840,14 @@ lval read_string_list(lval * g) {
 }
 
 unsigned hash(lval s) {
-    unsigned char *z = o2z(s);
+    unsigned char * z = (unsigned char *) o2z(s);
     unsigned i = 0, h = 0, g;
     while (i < o2s(s)[0] / 64 - 4) {
         h = (h << 4) + z[i++];
         g = h & 0xf0000000;
-        if (g)
+        if (g) {
             h = h ^ (g >> 24) ^ g;
+	}
     }
     return h;
 }
@@ -1603,7 +1856,7 @@ lval lhash(lval * f) {
     return d2o(f, hash(f[1]));
 }
 
-lval is(lval * g, lval p, lval s) {
+lval make_symbol(lval * g, lval p, lval s) {
     int h = hash(s) % 1021;
     int i = 3;
     lval m;
@@ -1628,11 +1881,14 @@ lval is(lval * g, lval p, lval s) {
 lval read_symbol(lval * g) {
     int c = getc(ins);
     if (isspace(c) || c == ')' || c == EOF) {
-        if (c != EOF)
+        if (c != EOF) {
             ungetc(c, ins);
+	}
         return 0;
-    } if (c > 96 && c < 123)
+    } 
+    if (c > 96 && c < 123) {
         c -= 32;
+    }
     return cons(g, (c << 5) | 24, read_symbol(g));
 }
 
@@ -1642,8 +1898,9 @@ lval list2(lval * g, int a) {
 
 lval lread(lval * g) {
     int c = getnws();
-    if (c == EOF)
+    if (c == EOF) {
         return 8;
+    }
     if (c == '(')
         return read_list(g);
     if (c == '\"')
@@ -1678,7 +1935,7 @@ lval lread(lval * g) {
     if (c == ':') {
         getnws();
     }
-    return is(g, c == ':' ? kwp : pkg, stringify(g, read_symbol(g)));
+    return make_symbol(g, c == ':' ? kwp : pkg, stringify(g, read_symbol(g)));
 }
 
 lval strf(lval * f, const char *s) {
@@ -1770,26 +2027,31 @@ struct symbol_init symi[] = {
     {"*ERROR-OUTPUT*"}, /* must be 80 */
     {"*PACKAGES*"}, {"STRING=", lstring_equal, 2},
     {"IMAKUNBOUND", limakunbound, 2}, {"EVAL", leval, -2}, {"JREF", ljref, 2, setfjref, 3},
-    {"RUN-PROGRAM", lrp, -2}, {"UNAME", luname, 0}, {"EXIT", lexit, 1}, {"QUIT", lexit, 1}
+    {"RUN-PROGRAM", lrp, -2}, {"UNAME", luname, 0}, 
+    {"EXIT", lexit, 1}, {"QUIT", lexit, 1},
+    {"INSPECT", linspect, 1}
 };
 
 int main(int argc, char *argv[]) {
+    int stack_size = sizeof(lval) * 64 * 1024;
     lval *g;
     int i;
     lval sym;
-    memory_size = 4 * 2048 * 1024;
+    memory_size = sizeof(lval) * 2048 * 1024;
     memory = malloc(memory_size);
     memf = memory;
     memset(memory, 0, memory_size);
     memf[0] = 0;
-    memf[1] = memory_size / 4;
-    stack = malloc(256 * 1024);
-    memset(stack, 0, 256 * 1024);
-    g = stack + 5;
+    memf[1] = memory_size / sizeof(lval);
+    stack = malloc(stack_size);
+    memset(stack, 0, stack_size);
+    g = stack + 5; /* TODO: constants for stack management */
     pkg = mkp(g, "CL", "COMMON-LISP");
     for (i = 0; i < countof(symi); i++) {
-        sym = is(g, pkg, strf(g, symi[i].name));
-        if (i < 10) {
+        sym = make_symbol(g, pkg, strf(g, symi[i].name));
+        if (i == 0) {
+	    o2a(sym)[4] = LVAL_NIL;
+	} else if (i < 10) {
             o2a(sym)[4] = sym;
         }
         ins = stdin;

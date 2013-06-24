@@ -1,19 +1,23 @@
-CFLAGS  = -g -Wall -O0
+
+CMN     = -m32 -g -O0
+#CMN     = -m32 -O2 -fomit-frame-pointer
+
+CFLAGS  = $(CMN) -pedantic -Wall
 CC      = gcc
-LFLAGS  = -g -lm -ldl
+LFLAGS  = $(CMN) -lm -ldl
 LINKER  = gcc
 
 
 ## Rules
 
-target/lisp800: target/lisp800.o
-	$(LINKER) -o target/lisp800 target/lisp800.o $(LFLAGS)
+build/lisp800: build/lisp800.o
+	$(LINKER) -o build/lisp800 build/lisp800.o $(LFLAGS)
 
-target/lisp800.o: target lisp800.c
-	$(CC) $(CFLAGS) -c lisp800.c -o target/lisp800.o
+build/lisp800.o: build c/lisp800.c
+	$(CC) $(CFLAGS) -c c/lisp800.c -o build/lisp800.o
 
-target:
-	mkdir target
+build:
+	mkdir build
 
 clean:
-	rm -rf target
+	rm -rf build
